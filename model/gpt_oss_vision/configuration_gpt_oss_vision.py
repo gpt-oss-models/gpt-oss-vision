@@ -71,6 +71,7 @@ class GPTOSSVisionConfig(PretrainedConfig):
     }
 
     def __init__(
+        self,
         # Text params
         num_hidden_layers: int = 36,
         num_local_experts: int = 128,

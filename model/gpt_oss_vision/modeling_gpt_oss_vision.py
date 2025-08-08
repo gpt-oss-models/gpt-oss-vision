@@ -108,11 +108,8 @@ class VisionAdapter(nn.Module):
             vit_embeds = x.flatten(2).transpose(1, 2)  # (B, seq, c)
         if self.pool_token is not None:
             pool = self.pool_token.expand(vit_embeds.shape[0], -1, -1)
-            # If ViT already includes cls token, keep it as pool replacement; otherwise prepend
-            if vit_embeds.shape[1] > 0:
-                vit_embeds = torch.cat([pool, vit_embeds[:, 1:, :]], dim=1)
-            else:
-                vit_embeds = pool
+            # For fallback conv, there's no class token to replace, so just prepend
+            vit_embeds = torch.cat([pool, vit_embeds], dim=1)
         vit_embeds = self.norm(vit_embeds)
         projected = self.proj(vit_embeds)
         return projected
@@ -543,9 +540,11 @@ class GptOssModel(GptOssPreTrainedModel):
             vision_embeds = self.vision_adapter(pixel_values)  # (B, vis_seq, hidden)
             if vision_embeds is None:
                 raise ValueError("VisionAdapter returned None; ensure ViT available or pixel_values correct.")
+            
             vis_len = vision_embeds.shape[1]
             inputs_embeds = torch.cat([vision_embeds, inputs_embeds], dim=1)
             B = inputs_embeds.shape[0]
+            
             # update/create attention_mask
             if attention_mask is None:
                 attention_mask = torch.ones(B, inputs_embeds.shape[1], dtype=torch.long, device=inputs_embeds.device)
@@ -554,6 +553,19 @@ class GptOssModel(GptOssPreTrainedModel):
                 if attention_mask.dim() == 2 and attention_mask.shape[1] == (inputs_embeds.shape[1] - vis_len):
                     vis_ones = torch.ones(B, vis_len, dtype=attention_mask.dtype, device=attention_mask.device)
                     attention_mask = torch.cat([vis_ones, attention_mask], dim=1)
+            
+            # Update position_ids to account for vision tokens
+            # Vision tokens should start from position 0, text tokens continue from there
+            if position_ids is not None:
+                # Create new position_ids that start from 0 for vision tokens
+                new_position_ids = torch.arange(inputs_embeds.shape[1], device=position_ids.device, dtype=position_ids.dtype)
+                new_position_ids = new_position_ids.unsqueeze(0).expand(B, -1)
+                position_ids = new_position_ids
+            else:
+                # If position_ids was None, create it for the full sequence
+                position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device, dtype=torch.long)
+                position_ids = position_ids.unsqueeze(0).expand(B, -1)
+            
             modality_mask = torch.zeros(B, inputs_embeds.shape[1], dtype=torch.bool, device=inputs_embeds.device)
             modality_mask[:, :vis_len] = True
 

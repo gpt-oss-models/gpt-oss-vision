@@ -134,7 +134,8 @@ class VisionAdapter(nn.Module):
         if self.pool_token is not None:
             # pool token expand and prepend
             pool = self.pool_token.expand(vit_embeds.shape[0], -1, -1)  # (batch, 1, vit_hidden)
-            vit_embeds = torch.cat([pool, vit_embeds[:, 1:, :]], dim=1) if vit_embeds.shape[1] > 0 else pool
+            # For fallback conv, there's no class token to replace, so just prepend
+            vit_embeds = torch.cat([pool, vit_embeds], dim=1)
 
         # normative projection to model hidden size
         vit_embeds = self.norm(vit_embeds)
@@ -539,8 +540,10 @@ class GptOssModel(MixtralModel):
             vision_embeds = self.vision_adapter(pixel_values)  # (batch, vis_seq_len, hidden_size)
             if vision_embeds is None:
                 raise ValueError("Vision adapter returned None. Ensure ViT is available or provide pixel_values correctly.")
+            
             # Prepend vision embeds to inputs_embeds
             inputs_embeds = torch.cat([vision_embeds, inputs_embeds], dim=1)
+            
             # Update attention mask: if not provided create ones
             batch_size = inputs_embeds.shape[0]
             vis_len = vision_embeds.shape[1]
@@ -553,6 +556,19 @@ class GptOssModel(MixtralModel):
                 if attention_mask.dim() == 2 and attention_mask.shape[1] == (inputs_embeds.shape[1] - vis_len):
                     vis_ones = torch.ones(batch_size, vis_len, dtype=attention_mask.dtype, device=attention_mask.device)
                     attention_mask = torch.cat([vis_ones, attention_mask], dim=1)
+            
+            # Update position_ids to account for vision tokens
+            # Vision tokens should start from position 0, text tokens continue from there
+            if position_ids is not None:
+                # Create new position_ids that start from 0 for vision tokens
+                new_position_ids = torch.arange(inputs_embeds.shape[1], device=position_ids.device, dtype=position_ids.dtype)
+                new_position_ids = new_position_ids.unsqueeze(0).expand(batch_size, -1)
+                position_ids = new_position_ids
+            else:
+                # If position_ids was None, create it for the full sequence
+                position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device, dtype=torch.long)
+                position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+            
             # modality_mask: True==vision, False==text
             modality_mask = torch.zeros(batch_size, inputs_embeds.shape[1], dtype=torch.bool, device=inputs_embeds.device)
             modality_mask[:, :vis_len] = True
