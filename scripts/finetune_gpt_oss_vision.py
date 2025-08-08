@@ -1,52 +1,52 @@
 #!/usr/bin/env python3
-# coding=utf-8
-# Copyright 2025 Dustin Loring
-# 
-# Fine-tuning script for GPT-OSS-Vision model
-# Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# This script provides fine-tuning capabilities for the GPT-OSS-Vision model
-# with support for both text and vision inputs, and automatic upload to Hugging Face.
-# Contact: Dustin Loring <Dustinwloring1988@gmail.com>
+"""
+GPT-OSS-Vision Fine-tuning Script
 
-import os
+This script fine-tunes the gpt-oss-vision model on the lmms-lab/LLaVA-OneVision-Data dataset.
+It extends the openai/gpt-oss-20b base model with vision capabilities.
+
+Usage:
+    python finetune_gpt_oss_vision.py --config config.yaml
+
+Author: Dustin Loring <dustinwloring1988@gmail.com>
+"""
+
 import argparse
 import json
 import logging
+import os
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Any
 import warnings
 
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import transformers
 from transformers import (
+    AutoConfig,
     AutoTokenizer,
     AutoModelForCausalLM,
-    TrainingArguments,
     Trainer,
+    TrainingArguments,
     DataCollatorForLanguageModeling,
-    get_linear_schedule_with_warmup,
-    set_seed,
+    HfArgumentParser,
 )
-from datasets import Dataset, load_dataset
-from accelerate import Accelerator
-from huggingface_hub import HfApi, login
-import wandb
+from transformers.trainer_utils import get_last_checkpoint
+from transformers.utils import check_min_version
+from transformers.utils.versions import require_version
+from datasets import load_dataset, DatasetDict, Dataset as HFDataset
 from PIL import Image
+import requests
+from io import BytesIO
 import numpy as np
+import math
 
-# Import your custom model components
-from model.gpt_oss_vision import (
-    GPTOSSVisionConfig,
-    GPTOSSVisionForCausalLM,
-    GPTOSSVisionTokenizer,
-    GPTOSSVisionImageProcessor,
-    GPTOSSVisionProcessor,
-)
+# Check versions
+check_min_version("4.36.0")
+require_version("datasets>=2.15.0", "To fix: pip install -r requirements.txt")
 
 # Set up logging
 logging.basicConfig(
@@ -56,484 +56,561 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Suppress warnings
-warnings.filterwarnings("ignore")
+# Suppress some warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 
 
-class GPTOSSVisionFineTuner:
-    """
-    Fine-tuning class for GPT-OSS-Vision model with support for:
-    - Text-only fine-tuning
-    - Multimodal (text + image) fine-tuning
-    - Automatic Hugging Face upload
-    - WandB integration
-    - Gradient checkpointing and mixed precision
-    """
+@dataclass
+class ModelArguments:
+    """Arguments pertaining to which model/config/tokenizer we are going to fine-tune."""
+    
+    model_name_or_path: Optional[str] = field(
+        default="openai/gpt-oss-20b",
+        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models."}
+    )
+    model_revision: str = field(
+        default="main",
+        metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."}
+    )
+    tokenizer_name: Optional[str] = field(
+        default=None,
+        metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
+    )
+    cache_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Where to store the pretrained models downloaded from huggingface.co"}
+    )
+    use_fast_tokenizer: bool = field(
+        default=True,
+        metadata={"help": "Whether to use one of the fast tokenizer (backed by tokenizers library) or not."}
+    )
+    model_max_length: int = field(
+        default=2048,
+        metadata={"help": "Maximum sequence length. Sequences will be right-padded (and possibly truncated)."}
+    )
+    use_auth_token: bool = field(
+        default=False,
+        metadata={"help": "Will use the token generated when running `transformers-cli login`."}
+    )
+    trust_remote_code: bool = field(
+        default=False,
+        metadata={"help": "Enable unpickling of arbitrary code in AutoModelForCausalLM#from_pretrained."}
+    )
+    # Vision specific arguments
+    vision_encoder_name: str = field(
+        default="openai/clip-vit-large-patch14-336",
+        metadata={"help": "Vision encoder to use for image processing"}
+    )
+    image_size: int = field(
+        default=336,
+        metadata={"help": "Input image size for vision encoder"}
+    )
+    patch_size: int = field(
+        default=14,
+        metadata={"help": "Patch size for vision transformer"}
+    )
+
+
+@dataclass
+class DataTrainingArguments:
+    """Arguments pertaining to what data we are going to input our model for training and eval."""
+    
+    dataset_name: Optional[str] = field(
+        default="lmms-lab/LLaVA-OneVision-Data",
+        metadata={"help": "The name of the dataset to use (via the datasets library)."}
+    )
+    dataset_config_name: Optional[str] = field(
+        default="websight(cauldron)",
+        metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
+    )
+    train_file: Optional[str] = field(
+        default=None,
+        metadata={"help": "The input training data file (a text file)."}
+    )
+    validation_file: Optional[str] = field(
+        default=None,
+        metadata={"help": "An optional input evaluation data file to evaluate the perplexity on (a text file)."}
+    )
+    max_train_samples: Optional[int] = field(
+        default=None,
+        metadata={"help": "For debugging purposes or quicker training, truncate training examples."}
+    )
+    max_eval_samples: Optional[int] = field(
+        default=None,
+        metadata={"help": "For debugging purposes or quicker training, truncate evaluation examples."}
+    )
+    streaming: bool = field(
+        default=False,
+        metadata={"help": "Enable streaming mode"}
+    )
+    block_size: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional input sequence length after tokenization."}
+    )
+    overwrite_cache: bool = field(
+        default=False,
+        metadata={"help": "Overwrite the cached training and evaluation sets"}
+    )
+    validation_split_percentage: Optional[int] = field(
+        default=5,
+        metadata={"help": "The percentage of the train set used as validation set."}
+    )
+    preprocessing_num_workers: Optional[int] = field(
+        default=None,
+        metadata={"help": "The number of processes to use for the preprocessing."}
+    )
+    keep_linebreaks: bool = field(
+        default=True,
+        metadata={"help": "Whether to keep line breaks when using TXT files or not."}
+    )
+    # Multimodal specific arguments
+    image_token: str = field(
+        default="<image>",
+        metadata={"help": "Token used to represent images in text"}
+    )
+    max_images_per_sample: int = field(
+        default=8,
+        metadata={"help": "Maximum number of images per training sample"}
+    )
+
+
+class LLaVAOneVisionDataset(Dataset):
+    """Custom dataset for LLaVA-OneVision data with multimodal support."""
     
     def __init__(
-        self,
-        model_name_or_path: str,
-        output_dir: str,
-        hf_repo_id: Optional[str] = None,
-        hf_token: Optional[str] = None,
-        use_wandb: bool = True,
-        seed: int = 42,
-    ):
-        self.model_name_or_path = model_name_or_path
-        self.output_dir = Path(output_dir)
-        self.hf_repo_id = hf_repo_id
-        self.hf_token = hf_token
-        self.use_wandb = use_wandb
-        self.seed = seed
-        
-        # Set seed for reproducibility
-        set_seed(seed)
-        
-        # Initialize accelerator for distributed training
-        self.accelerator = Accelerator(
-            mixed_precision="fp16",
-            gradient_accumulation_steps=1,
-        )
-        
-        # Initialize components
-        self.config = None
-        self.tokenizer = None
-        self.image_processor = None
-        self.processor = None
-        self.model = None
-        self.trainer = None
-        
-        # Setup Hugging Face
-        if hf_token:
-            login(hf_token)
-            self.hf_api = HfApi()
-        else:
-            self.hf_api = None
-            
-        # Setup WandB
-        if use_wandb:
-            wandb.init(project="gpt-oss-vision-finetune")
-    
-    def load_model_and_tokenizer(self, load_in_8bit: bool = False, load_in_4bit: bool = False):
-        """Load the model, tokenizer, and processors."""
-        logger.info(f"Loading model and tokenizer from {self.model_name_or_path}")
-        
-        # Load configuration
-        self.config = GPTOSSVisionConfig.from_pretrained(self.model_name_or_path)
-        
-        # Load tokenizer
-        try:
-            self.tokenizer = GPTOSSVisionTokenizer.from_pretrained(self.model_name_or_path)
-        except:
-            logger.warning("Custom tokenizer not found, falling back to AutoTokenizer")
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path)
-        
-        # Ensure tokenizer has padding token
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        
-        # Load image processor
-        try:
-            self.image_processor = GPTOSSVisionImageProcessor.from_pretrained(self.model_name_or_path)
-        except:
-            logger.warning("Custom image processor not found, using default")
-            self.image_processor = None
-        
-        # Load processor (combines tokenizer and image processor)
-        try:
-            self.processor = GPTOSSVisionProcessor.from_pretrained(self.model_name_or_path)
-        except:
-            logger.warning("Custom processor not found, will use separate tokenizer and image processor")
-            self.processor = None
-        
-        # Load model
-        if load_in_8bit:
-            from transformers import BitsAndBytesConfig
-            quantization_config = BitsAndBytesConfig(load_in_8bit=True)
-            self.model = GPTOSSVisionForCausalLM.from_pretrained(
-                self.model_name_or_path,
-                config=self.config,
-                quantization_config=quantization_config,
-                device_map="auto",
-                torch_dtype=torch.float16,
-            )
-        elif load_in_4bit:
-            from transformers import BitsAndBytesConfig
-            quantization_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-            )
-            self.model = GPTOSSVisionForCausalLM.from_pretrained(
-                self.model_name_or_path,
-                config=self.config,
-                quantization_config=quantization_config,
-                device_map="auto",
-                torch_dtype=torch.float16,
-            )
-        else:
-            self.model = GPTOSSVisionForCausalLM.from_pretrained(
-                self.model_name_or_path,
-                config=self.config,
-                torch_dtype=torch.float16,
-            )
-        
-        logger.info(f"Model loaded with {self.model.num_parameters():,} parameters")
-    
-    def prepare_dataset(
-        self,
-        dataset_path: str,
-        dataset_type: str = "text_only",  # "text_only" or "multimodal"
-        max_length: int = 2048,
-        image_size: int = 224,
-        text_column: str = "text",
-        image_column: str = "image",
-        split: str = "train",
-    ) -> Dataset:
-        """Prepare dataset for fine-tuning."""
-        logger.info(f"Loading dataset from {dataset_path}")
-        
-        # Load dataset
-        if dataset_path.endswith(('.json', '.jsonl')):
-            dataset = load_dataset('json', data_files=dataset_path, split=split)
-        else:
-            dataset = load_dataset(dataset_path, split=split)
-        
-        if dataset_type == "text_only":
-            return self._prepare_text_dataset(dataset, max_length, text_column)
-        elif dataset_type == "multimodal":
-            return self._prepare_multimodal_dataset(dataset, max_length, image_size, text_column, image_column)
-        else:
-            raise ValueError(f"Unknown dataset_type: {dataset_type}")
-    
-    def _prepare_text_dataset(self, dataset: Dataset, max_length: int, text_column: str) -> Dataset:
-        """Prepare text-only dataset."""
-        def tokenize_function(examples):
-            # Tokenize text
-            tokenized = self.tokenizer(
-                examples[text_column],
-                truncation=True,
-                padding=False,
-                max_length=max_length,
-                return_tensors=None,
-            )
-            
-            # Add labels (same as input_ids for causal LM)
-            tokenized["labels"] = tokenized["input_ids"].copy()
-            
-            return tokenized
-        
-        # Apply tokenization
-        tokenized_dataset = dataset.map(
-            tokenize_function,
-            batched=True,
-            remove_columns=dataset.column_names,
-            desc="Tokenizing text dataset",
-        )
-        
-        return tokenized_dataset
-    
-    def _prepare_multimodal_dataset(
         self, 
-        dataset: Dataset, 
-        max_length: int, 
-        image_size: int, 
-        text_column: str, 
-        image_column: str
-    ) -> Dataset:
-        """Prepare multimodal dataset with text and images."""
-        def process_multimodal(examples):
-            # Process images
-            images = []
-            for image_path in examples[image_column]:
-                if isinstance(image_path, str):
-                    image = Image.open(image_path).convert('RGB')
-                else:
-                    image = image_path
-                
-                # Resize image
-                image = image.resize((image_size, image_size))
-                images.append(image)
-            
-            # Process text
-            texts = examples[text_column]
-            
-            # Use processor if available, otherwise process separately
-            if self.processor:
-                processed = self.processor(
-                    text=texts,
-                    images=images,
-                    truncation=True,
-                    padding=False,
-                    max_length=max_length,
-                    return_tensors=None,
-                )
-            else:
-                # Process text
-                text_processed = self.tokenizer(
-                    texts,
-                    truncation=True,
-                    padding=False,
-                    max_length=max_length,
-                    return_tensors=None,
-                )
-                
-                # Process images
-                if self.image_processor:
-                    image_processed = self.image_processor(
-                        images,
-                        return_tensors=None,
-                    )
-                else:
-                    # Convert to tensors manually
-                    image_processed = {
-                        "pixel_values": [np.array(img) for img in images]
-                    }
-                
-                # Combine
-                processed = {**text_processed, **image_processed}
-            
-            # Add labels
-            processed["labels"] = processed["input_ids"].copy()
-            
-            return processed
-        
-        # Apply processing
-        processed_dataset = dataset.map(
-            process_multimodal,
-            batched=True,
-            remove_columns=dataset.column_names,
-            desc="Processing multimodal dataset",
-        )
-        
-        return processed_dataset
-    
-    def setup_training(
-        self,
-        dataset: Dataset,
-        batch_size: int = 4,
-        gradient_accumulation_steps: int = 4,
-        learning_rate: float = 5e-5,
-        num_train_epochs: int = 3,
-        warmup_steps: int = 100,
-        weight_decay: float = 0.01,
-        max_grad_norm: float = 1.0,
-        save_steps: int = 500,
-        eval_steps: int = 500,
-        logging_steps: int = 10,
-        save_total_limit: int = 3,
-        dataloader_pin_memory: bool = False,
-        gradient_checkpointing: bool = True,
-        fp16: bool = True,
-        dataloader_num_workers: int = 4,
+        dataset: HFDataset, 
+        tokenizer, 
+        image_processor,
+        max_length: int = 2048,
+        image_token: str = "<image>",
+        max_images: int = 8
     ):
-        """Setup training configuration and trainer."""
-        logger.info("Setting up training configuration")
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+        self.max_length = max_length
+        self.image_token = image_token
+        self.max_images = max_images
         
-        # Create output directory
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Training arguments
-        training_args = TrainingArguments(
-            output_dir=str(self.output_dir),
-            per_device_train_batch_size=batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            learning_rate=learning_rate,
-            num_train_epochs=num_train_epochs,
-            warmup_steps=warmup_steps,
-            weight_decay=weight_decay,
-            max_grad_norm=max_grad_norm,
-            save_steps=save_steps,
-            eval_steps=eval_steps,
-            logging_steps=logging_steps,
-            save_total_limit=save_total_limit,
-            dataloader_pin_memory=dataloader_pin_memory,
-            gradient_checkpointing=gradient_checkpointing,
-            fp16=fp16,
-            dataloader_num_workers=dataloader_num_workers,
-            remove_unused_columns=False,
-            report_to="wandb" if self.use_wandb else None,
-            run_name=f"gpt-oss-vision-finetune-{self.seed}",
-            load_best_model_at_end=True,
-            metric_for_best_model="eval_loss",
-            greater_is_better=False,
-            push_to_hub=False,  # We'll handle this manually
-        )
-        
-        # Data collator
-        data_collator = DataCollatorForLanguageModeling(
-            tokenizer=self.tokenizer,
-            mlm=False,  # We're doing causal LM, not masked LM
-        )
-        
-        # Initialize trainer
-        self.trainer = Trainer(
-            model=self.model,
-            args=training_args,
-            train_dataset=dataset,
-            data_collator=data_collator,
-            tokenizer=self.tokenizer,
-        )
-        
-        # Prepare with accelerator
-        self.trainer.model, self.trainer.optimizer, self.trainer.lr_scheduler = self.accelerator.prepare(
-            self.trainer.model, self.trainer.optimizer, self.trainer.lr_scheduler
-        )
+        # Add special tokens if needed
+        if self.image_token not in self.tokenizer.get_vocab():
+            self.tokenizer.add_tokens([self.image_token])
+            
+    def __len__(self):
+        return len(self.dataset)
     
-    def train(self):
-        """Start training."""
-        if self.trainer is None:
-            raise ValueError("Trainer not set up. Call setup_training() first.")
-        
-        logger.info("Starting training...")
-        
-        # Train the model
-        train_result = self.trainer.train()
-        
-        # Save the model
-        self.trainer.save_model()
-        
-        # Save training metrics
-        metrics = train_result.metrics
-        self.trainer.log_metrics("train", metrics)
-        self.trainer.save_metrics("train", metrics)
-        self.trainer.save_state()
-        
-        logger.info(f"Training completed. Metrics: {metrics}")
-        
-        return train_result
-    
-    def upload_to_huggingface(self, commit_message: str = "Add fine-tuned GPT-OSS-Vision model"):
-        """Upload the fine-tuned model to Hugging Face Hub."""
-        if not self.hf_repo_id or not self.hf_api:
-            logger.warning("Hugging Face repo ID or API not configured. Skipping upload.")
-            return
-        
-        logger.info(f"Uploading model to {self.hf_repo_id}")
-        
+    def load_image(self, image_path_or_url: str) -> Optional[Image.Image]:
+        """Load image from path or URL."""
         try:
-            # Push to hub
-            self.trainer.push_to_hub(
-                repo_id=self.hf_repo_id,
-                commit_message=commit_message,
-                private=False,  # Set to True if you want a private repo
+            if image_path_or_url.startswith(('http://', 'https://')):
+                response = requests.get(image_path_or_url, timeout=10)
+                image = Image.open(BytesIO(response.content))
+            else:
+                image = Image.open(image_path_or_url)
+            return image.convert('RGB')
+        except Exception as e:
+            logger.warning(f"Failed to load image {image_path_or_url}: {e}")
+            return None
+    
+    def __getitem__(self, idx):
+        """Get a single training example."""
+        try:
+            item = self.dataset[idx]
+            
+            # Extract conversation data
+            conversations = item.get('conversations', [])
+            images = item.get('image', []) if isinstance(item.get('image'), list) else [item.get('image')] if item.get('image') else []
+            
+            # Process images
+            processed_images = []
+            for img in images[:self.max_images]:  # Limit number of images
+                if img:
+                    pil_img = self.load_image(img)
+                    if pil_img:
+                        processed_images.append(pil_img)
+            
+            # Build conversation text
+            text_parts = []
+            for conv in conversations:
+                role = conv.get('from', 'unknown')
+                content = conv.get('value', '')
+                
+                if role == 'human':
+                    # Insert image tokens for human messages
+                    if processed_images and self.image_token not in content:
+                        content = f"{self.image_token}\n{content}"
+                    text_parts.append(f"Human: {content}")
+                elif role == 'gpt':
+                    text_parts.append(f"Assistant: {content}")
+            
+            full_text = "\n".join(text_parts)
+            
+            # Tokenize text
+            encoding = self.tokenizer(
+                full_text,
+                truncation=True,
+                max_length=self.max_length,
+                padding="max_length",
+                return_tensors="pt"
             )
             
-            logger.info(f"Successfully uploaded model to {self.hf_repo_id}")
+            # Process images if any
+            pixel_values = None
+            if processed_images:
+                try:
+                    pixel_values = self.image_processor(
+                        processed_images, 
+                        return_tensors="pt"
+                    )['pixel_values']
+                except Exception as e:
+                    logger.warning(f"Failed to process images: {e}")
+                    pixel_values = None
+            
+            return {
+                'input_ids': encoding['input_ids'].squeeze(),
+                'attention_mask': encoding['attention_mask'].squeeze(),
+                'labels': encoding['input_ids'].squeeze(),  # For causal LM
+                'pixel_values': pixel_values.squeeze() if pixel_values is not None else None,
+            }
             
         except Exception as e:
-            logger.error(f"Failed to upload model: {e}")
-            raise
+            logger.error(f"Error processing sample {idx}: {e}")
+            # Return a dummy sample
+            dummy_text = "This is a dummy sample due to processing error."
+            encoding = self.tokenizer(
+                dummy_text,
+                truncation=True,
+                max_length=self.max_length,
+                padding="max_length",
+                return_tensors="pt"
+            )
+            return {
+                'input_ids': encoding['input_ids'].squeeze(),
+                'attention_mask': encoding['attention_mask'].squeeze(),
+                'labels': encoding['input_ids'].squeeze(),
+                'pixel_values': None,
+            }
+
+
+class MultimodalDataCollator:
+    """Data collator for multimodal training."""
     
-    def cleanup(self):
-        """Clean up resources."""
-        if self.use_wandb:
-            wandb.finish()
+    def __init__(self, tokenizer, pad_to_multiple_of=None):
+        self.tokenizer = tokenizer
+        self.pad_to_multiple_of = pad_to_multiple_of
+    
+    def __call__(self, features):
+        # Separate text and image features
+        input_ids = [f['input_ids'] for f in features]
+        attention_masks = [f['attention_mask'] for f in features]
+        labels = [f['labels'] for f in features]
+        pixel_values = [f['pixel_values'] for f in features if f['pixel_values'] is not None]
+        
+        # Pad sequences
+        batch_size = len(input_ids)
+        max_length = max(len(ids) for ids in input_ids)
+        
+        # Pad to multiple if specified
+        if self.pad_to_multiple_of:
+            max_length = ((max_length + self.pad_to_multiple_of - 1) 
+                         // self.pad_to_multiple_of * self.pad_to_multiple_of)
+        
+        # Create padded tensors
+        padded_input_ids = torch.full((batch_size, max_length), self.tokenizer.pad_token_id, dtype=torch.long)
+        padded_attention_masks = torch.zeros((batch_size, max_length), dtype=torch.long)
+        padded_labels = torch.full((batch_size, max_length), -100, dtype=torch.long)
+        
+        for i, (ids, mask, lbls) in enumerate(zip(input_ids, attention_masks, labels)):
+            length = len(ids)
+            padded_input_ids[i, :length] = ids
+            padded_attention_masks[i, :length] = mask
+            padded_labels[i, :length] = lbls
+        
+        batch = {
+            'input_ids': padded_input_ids,
+            'attention_mask': padded_attention_masks,
+            'labels': padded_labels,
+        }
+        
+        # Add pixel values if present
+        if pixel_values:
+            # Stack pixel values, padding with zeros if needed
+            max_imgs = max(pv.shape[0] if pv.dim() > 3 else 1 for pv in pixel_values)
+            img_shape = pixel_values[0].shape[-3:] if pixel_values else (3, 336, 336)
+            
+            batch_pixel_values = torch.zeros((batch_size, max_imgs, *img_shape))
+            for i, pv in enumerate(pixel_values):
+                if pv.dim() > 3:
+                    num_imgs = min(pv.shape[0], max_imgs)
+                    batch_pixel_values[i, :num_imgs] = pv[:num_imgs]
+                else:
+                    batch_pixel_values[i, 0] = pv
+            
+            batch['pixel_values'] = batch_pixel_values
+        
+        return batch
+
+
+def setup_model_and_tokenizer(model_args: ModelArguments):
+    """Set up the model, tokenizer, and image processor."""
+    
+    logger.info(f"Loading tokenizer from {model_args.tokenizer_name or model_args.model_name_or_path}")
+    
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+        cache_dir=model_args.cache_dir,
+        use_fast=model_args.use_fast_tokenizer,
+        revision=model_args.model_revision,
+        use_auth_token=True if model_args.use_auth_token else None,
+        trust_remote_code=model_args.trust_remote_code,
+    )
+    
+    # Add padding token if not present
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    # Set model max length
+    if model_args.model_max_length:
+        tokenizer.model_max_length = model_args.model_max_length
+    
+    logger.info(f"Loading base model from {model_args.model_name_or_path}")
+    
+    # Load base model configuration
+    config = AutoConfig.from_pretrained(
+        model_args.model_name_or_path,
+        cache_dir=model_args.cache_dir,
+        revision=model_args.model_revision,
+        use_auth_token=True if model_args.use_auth_token else None,
+        trust_remote_code=model_args.trust_remote_code,
+    )
+    
+    # Load base model
+    model = AutoModelForCausalLM.from_pretrained(
+        model_args.model_name_or_path,
+        config=config,
+        cache_dir=model_args.cache_dir,
+        revision=model_args.model_revision,
+        use_auth_token=True if model_args.use_auth_token else None,
+        trust_remote_code=model_args.trust_remote_code,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+    )
+    
+    # Resize token embeddings if we added new tokens
+    model.resize_token_embeddings(len(tokenizer))
+    
+    logger.info("Setting up image processor")
+    # Set up image processor (using CLIP for now)
+    from transformers import CLIPImageProcessor
+    image_processor = CLIPImageProcessor.from_pretrained(
+        model_args.vision_encoder_name,
+        cache_dir=model_args.cache_dir,
+    )
+    
+    logger.info(f"Model setup complete. Model type: {type(model).__name__}")
+    logger.info(f"Tokenizer vocab size: {len(tokenizer)}")
+    
+    return model, tokenizer, image_processor
+
+
+def setup_datasets(data_args: DataTrainingArguments, tokenizer, image_processor):
+    """Load and preprocess the datasets."""
+    
+    logger.info(f"Loading dataset: {data_args.dataset_name}")
+    
+    # Load dataset
+    if data_args.dataset_name:
+        raw_datasets = load_dataset(
+            data_args.dataset_name,
+            data_args.dataset_config_name,
+            cache_dir=data_args.cache_dir if hasattr(data_args, 'cache_dir') else None,
+            streaming=data_args.streaming,
+        )
+    else:
+        data_files = {}
+        if data_args.train_file:
+            data_files["train"] = data_args.train_file
+        if data_args.validation_file:
+            data_files["validation"] = data_args.validation_file
+        
+        extension = data_args.train_file.split(".")[-1] if data_args.train_file else "json"
+        raw_datasets = load_dataset(extension, data_files=data_files)
+    
+    # Split dataset if needed
+    if "train" not in raw_datasets.keys():
+        raw_datasets["train"] = load_dataset(
+            data_args.dataset_name,
+            data_args.dataset_config_name,
+            split=f"train[:{data_args.validation_split_percentage}%]",
+            cache_dir=data_args.cache_dir if hasattr(data_args, 'cache_dir') else None,
+        )
+        raw_datasets["validation"] = load_dataset(
+            data_args.dataset_name,
+            data_args.dataset_config_name,
+            split=f"train[{data_args.validation_split_percentage}%:]",
+            cache_dir=data_args.cache_dir if hasattr(data_args, 'cache_dir') else None,
+        )
+    
+    # Limit samples for debugging
+    if data_args.max_train_samples is not None:
+        max_train_samples = min(len(raw_datasets["train"]), data_args.max_train_samples)
+        raw_datasets["train"] = raw_datasets["train"].select(range(max_train_samples))
+    
+    if data_args.max_eval_samples is not None and "validation" in raw_datasets:
+        max_eval_samples = min(len(raw_datasets["validation"]), data_args.max_eval_samples)
+        raw_datasets["validation"] = raw_datasets["validation"].select(range(max_eval_samples))
+    
+    # Create custom datasets
+    train_dataset = LLaVAOneVisionDataset(
+        raw_datasets["train"],
+        tokenizer,
+        image_processor,
+        max_length=data_args.block_size or tokenizer.model_max_length,
+        image_token=data_args.image_token,
+        max_images=data_args.max_images_per_sample,
+    )
+    
+    eval_dataset = None
+    if "validation" in raw_datasets:
+        eval_dataset = LLaVAOneVisionDataset(
+            raw_datasets["validation"],
+            tokenizer,
+            image_processor,
+            max_length=data_args.block_size or tokenizer.model_max_length,
+            image_token=data_args.image_token,
+            max_images=data_args.max_images_per_sample,
+        )
+    
+    logger.info(f"Train dataset size: {len(train_dataset)}")
+    if eval_dataset:
+        logger.info(f"Eval dataset size: {len(eval_dataset)}")
+    
+    return train_dataset, eval_dataset
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fine-tune GPT-OSS-Vision model")
+    # Parse arguments
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     
-    # Model and data arguments
-    parser.add_argument("--model_name_or_path", type=str, required=True,
-                       help="Path to pretrained model or model identifier from huggingface.co/models")
-    parser.add_argument("--dataset_path", type=str, required=True,
-                       help="Path to dataset file or dataset name from huggingface.co/datasets")
-    parser.add_argument("--dataset_type", type=str, default="text_only",
-                       choices=["text_only", "multimodal"],
-                       help="Type of dataset (text_only or multimodal)")
-    parser.add_argument("--output_dir", type=str, default="./finetuned_model",
-                       help="Output directory for the fine-tuned model")
+    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
+        # Load arguments from JSON file
+        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+    else:
+        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     
-    # Hugging Face arguments
-    parser.add_argument("--hf_repo_id", type=str, default=None,
-                       help="Hugging Face repository ID for uploading the model")
-    parser.add_argument("--hf_token", type=str, default=None,
-                       help="Hugging Face token for authentication")
-    
-    # Training arguments
-    parser.add_argument("--batch_size", type=int, default=4,
-                       help="Training batch size per device")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4,
-                       help="Number of steps for gradient accumulation")
-    parser.add_argument("--learning_rate", type=float, default=5e-5,
-                       help="Learning rate")
-    parser.add_argument("--num_train_epochs", type=int, default=3,
-                       help="Number of training epochs")
-    parser.add_argument("--max_length", type=int, default=2048,
-                       help="Maximum sequence length")
-    parser.add_argument("--image_size", type=int, default=224,
-                       help="Image size for multimodal training")
-    
-    # Model loading arguments
-    parser.add_argument("--load_in_8bit", action="store_true",
-                       help="Load model in 8-bit precision")
-    parser.add_argument("--load_in_4bit", action="store_true",
-                       help="Load model in 4-bit precision")
-    
-    # Other arguments
-    parser.add_argument("--use_wandb", action="store_true", default=True,
-                       help="Use Weights & Biases for logging")
-    parser.add_argument("--seed", type=int, default=42,
-                       help="Random seed")
-    parser.add_argument("--text_column", type=str, default="text",
-                       help="Column name for text data")
-    parser.add_argument("--image_column", type=str, default="image",
-                       help="Column name for image data")
-    
-    args = parser.parse_args()
-    
-    # Initialize fine-tuner
-    fine_tuner = GPTOSSVisionFineTuner(
-        model_name_or_path=args.model_name_or_path,
-        output_dir=args.output_dir,
-        hf_repo_id=args.hf_repo_id,
-        hf_token=args.hf_token,
-        use_wandb=args.use_wandb,
-        seed=args.seed,
+    # Set up logging
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
     )
     
-    try:
-        # Load model and tokenizer
-        fine_tuner.load_model_and_tokenizer(
-            load_in_8bit=args.load_in_8bit,
-            load_in_4bit=args.load_in_4bit,
-        )
+    log_level = training_args.get_process_log_level()
+    logger.setLevel(log_level)
+    transformers.utils.logging.set_verbosity(log_level)
+    transformers.utils.logging.enable_default_handler()
+    transformers.utils.logging.enable_explicit_format()
+    
+    # Log on each process the small summary
+    logger.warning(
+        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
+        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
+    )
+    logger.info(f"Training/evaluation parameters {training_args}")
+    
+    # Detect last checkpoint
+    last_checkpoint = None
+    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
+        last_checkpoint = get_last_checkpoint(training_args.output_dir)
+        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
+            raise ValueError(
+                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
+                "Use --overwrite_output_dir to overcome."
+            )
+        elif last_checkpoint is not None and training_args.resume_from_checkpoint is None:
+            logger.info(
+                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
+                "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
+            )
+    
+    # Set seed for reproducibility
+    transformers.set_seed(training_args.seed)
+    
+    # Setup model and tokenizer
+    model, tokenizer, image_processor = setup_model_and_tokenizer(model_args)
+    
+    # Setup datasets
+    train_dataset, eval_dataset = setup_datasets(data_args, tokenizer, image_processor)
+    
+    # Data collator
+    data_collator = MultimodalDataCollator(
+        tokenizer=tokenizer,
+        pad_to_multiple_of=8 if training_args.fp16 else None,
+    )
+    
+    # Initialize trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=eval_dataset if training_args.do_eval else None,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+    )
+    
+    # Training
+    if training_args.do_train:
+        checkpoint = None
+        if training_args.resume_from_checkpoint is not None:
+            checkpoint = training_args.resume_from_checkpoint
+        elif last_checkpoint is not None:
+            checkpoint = last_checkpoint
         
-        # Prepare dataset
-        dataset = fine_tuner.prepare_dataset(
-            dataset_path=args.dataset_path,
-            dataset_type=args.dataset_type,
-            max_length=args.max_length,
-            image_size=args.image_size,
-            text_column=args.text_column,
-            image_column=args.image_column,
-        )
+        logger.info("*** Starting training ***")
+        train_result = trainer.train(resume_from_checkpoint=checkpoint)
+        trainer.save_model()  # Saves the tokenizer too for easy upload
         
-        # Setup training
-        fine_tuner.setup_training(
-            dataset=dataset,
-            batch_size=args.batch_size,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            learning_rate=args.learning_rate,
-            num_train_epochs=args.num_train_epochs,
-        )
+        metrics = train_result.metrics
+        max_train_samples = len(train_dataset)
+        metrics["train_samples"] = min(max_train_samples, len(train_dataset))
         
-        # Train
-        train_result = fine_tuner.train()
+        trainer.log_metrics("train", metrics)
+        trainer.save_metrics("train", metrics)
+        trainer.save_state()
         
-        # Upload to Hugging Face
-        if args.hf_repo_id:
-            fine_tuner.upload_to_huggingface()
+        logger.info("*** Training completed ***")
+    
+    # Evaluation
+    if training_args.do_eval:
+        logger.info("*** Evaluating ***")
         
-        logger.info("Fine-tuning completed successfully!")
+        metrics = trainer.evaluate()
+        max_eval_samples = len(eval_dataset) if eval_dataset else 0
+        metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
         
-    except Exception as e:
-        logger.error(f"Fine-tuning failed: {e}")
-        raise
-    finally:
-        fine_tuner.cleanup()
+        try:
+            perplexity = math.exp(metrics["eval_loss"])
+        except OverflowError:
+            perplexity = float("inf")
+        metrics["perplexity"] = perplexity
+        
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
+        
+        logger.info("*** Evaluation completed ***")
+    
+    # Create model card
+    kwargs = {"finetuned_from": model_args.model_name_or_path, "tasks": "multimodal-chat"}
+    if data_args.dataset_name is not None:
+        kwargs["dataset_tags"] = data_args.dataset_name
+        kwargs["dataset"] = data_args.dataset_name
+    
+    if training_args.push_to_hub:
+        trainer.push_to_hub(**kwargs)
+    else:
+        trainer.create_model_card(**kwargs)
 
 
 if __name__ == "__main__":
