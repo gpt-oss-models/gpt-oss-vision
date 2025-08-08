@@ -1,0 +1,26 @@
+# Core dependencies for GPT-OSS-Vision
+transformers>=4.36.0
+torch>=2.0.0
+numpy>=1.21.0
+Pillow>=8.0.0
+tokenizers>=0.13.0
+regex>=2021.0.0
+
+# Optional vision dependencies
+torchvision>=0.15.0
+opencv-python>=4.5.0
+
+# Development dependencies
+pytest>=6.0.0
+pytest-cov>=2.0.0
+black>=22.0.0
+isort>=5.0.0
+flake8>=4.0.0
+mypy>=0.950
+
+# Additional utilities
+accelerate>=0.20.0
+datasets>=2.0.0
+evaluate>=0.4.0
+sentencepiece>=0.1.0
+protobuf>=3.20.0
