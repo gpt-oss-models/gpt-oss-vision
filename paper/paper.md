@@ -130,124 +130,16 @@ def apply_nope(cos, sin, layer_idx, stride):
 
 ---
 
-## 4. Training Methodology
+## 4. Limitations and Future Work
 
-### 4.1 Training Objectives
-
-The model is trained with multiple objectives:
-
-**Primary Loss:**
-```
-L_primary = CrossEntropyLoss(logits, labels)
-```
-
-**Auxiliary Losses:**
-```
-L_aux = α * L_load_balancing + β * L_vision_bias
-```
-
-Where:
-- **Load balancing loss**: Ensures balanced expert utilization
-- **Vision bias loss**: Encourages expert specialization for visual tokens
-
-### 4.2 Training Data
-
-The training corpus consists of:
-- **Text data**: Inherited from GPT-OSS-20B training corpus
-- **Image-text pairs**: Multimodal training examples
-- **Long-context examples**: Extended sequences for NoPE validation
-
-### 4.3 Training Infrastructure
-
-- **Framework**: PyTorch with Transformers library
-- **Hardware**: Multi-GPU distributed training
-- **Optimization**: Mixed precision with gradient accumulation
-- **Memory efficiency**: Gradient checkpointing and expert parallelism
-
----
-
-## 5. Experimental Results
-
-### 5.1 Multimodal Performance
-
-We evaluate the model on standard multimodal benchmarks:
-
-| Task | Metric | GPT-OSS-Vision | Baseline |
-|------|--------|----------------|----------|
-| VQA | Accuracy | 78.3% | 75.1% |
-| Image Captioning | BLEU-4 | 32.1 | 29.8 |
-| Visual Reasoning | Accuracy | 82.7% | 79.4% |
-
-### 5.2 Long-Context Evaluation
-
-NoPE effectiveness is measured on extended context tasks:
-
-| Context Length | Standard RoPE | NoPE | Improvement |
-|----------------|---------------|------|-------------|
-| 8K tokens | 89.2% | 89.1% | -0.1% |
-| 16K tokens | 76.8% | 84.3% | +7.5% |
-| 32K tokens | 62.1% | 78.9% | +16.8% |
-
-### 5.3 Expert Utilization
-
-Analysis of MoE routing patterns shows:
-- **Balanced utilization**: All experts receive similar token assignments
-- **Modality specialization**: Some experts show preference for visual tokens
-- **Load distribution**: Top-4 routing maintains efficiency
-
-### 5.4 Computational Efficiency
-
-| Model | Parameters | Active/Token | Memory (GB) | Speed (tokens/s) |
-|-------|------------|--------------|-------------|------------------|
-| GPT-OSS-20B | 20B | 4B | 40 | 45 |
-| GPT-OSS-Vision | 20B | 4B | 42 | 43 |
-
----
-
-## 6. Ablation Studies
-
-### 6.1 Vision Adapter Depth
-
-We evaluate the impact of ViT depth on performance:
-
-| ViT Layers | VQA Accuracy | Training Time | Memory |
-|------------|--------------|---------------|--------|
-| 12 | 75.8% | 1.0x | 40GB |
-| 24 | 78.3% | 1.2x | 42GB |
-| 36 | 79.1% | 1.5x | 45GB |
-
-### 6.2 NoPE Configuration
-
-Different NoPE stride values are compared:
-
-| Stride | 8K Retention | 16K Retention | 32K Retention |
-|--------|--------------|---------------|----------------|
-| 2 | 89.0% | 82.1% | 75.3% |
-| 4 | 89.1% | 84.3% | 78.9% |
-| 8 | 89.2% | 86.7% | 81.2% |
-
-### 6.3 Expert Count Impact
-
-Varying the number of experts per token:
-
-| Experts/Token | VQA Accuracy | Training Speed | Memory |
-|---------------|--------------|----------------|--------|
-| 2 | 76.1% | 1.3x | 38GB |
-| 4 | 78.3% | 1.0x | 42GB |
-| 8 | 79.8% | 0.7x | 48GB |
-
----
-
-## 7. Limitations and Future Work
-
-### 7.1 Current Limitations
+### 4.1 Current Limitations
 
 - **Vision dependency**: Requires ViT for image processing
 - **Context scaling**: Performance may degrade beyond 131K tokens
 - **Training data**: Limited by available multimodal corpora
 - **Expert routing**: May show imbalances in edge cases
 
-### 7.2 Future Directions
+### 4.2 Future Directions
 
 - **Dynamic expert allocation**: Adaptive routing based on input modality
 - **Hierarchical vision processing**: Multi-scale feature extraction
@@ -256,7 +148,7 @@ Varying the number of experts per token:
 
 ---
 
-## 8. Conclusion
+## 5. Conclusion
 
 GPT-OSS-Vision successfully extends the GPT-OSS-20B architecture with multimodal capabilities and improved long-context processing. The combination of a lightweight vision adapter, vision-aware expert routing, and configurable NoPE implementation provides a robust foundation for multimodal AI applications while maintaining the efficiency benefits of the original MoE design.
 
